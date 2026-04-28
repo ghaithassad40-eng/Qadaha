@@ -1,10 +1,11 @@
 'use client'
 
-import { useState, useCallback } from 'react'
-import type { Category, Screen, Group, ActiveChallenge, ResultType } from '@/lib/types'
+import { useState, useCallback, useEffect } from 'react'
+import type { Category, Screen, Group, ActiveChallenge, ResultType, ChallengeItem } from '@/lib/types'
 import { CHALLENGE_TYPES, GROUP_COLORS } from '@/lib/constants'
 import { DB } from '@/lib/gameData'
 import { getAnnouncerLine, AnnouncerContext } from '@/lib/announcer'
+import { getTriviaQuestions, prefetchTrivia } from '@/lib/triviaApi'
 
 function buildCtx(
   groups: Group[],
@@ -17,12 +18,12 @@ function buildCtx(
   const sorted = [...groups].sort((a, b) => b.score - a.score)
   const currentScore = overrideScore ?? current.score
   return {
-    team:     current.name,
-    others:   others.map(g => g.name),
-    leader:   sorted[0].name,
-    lagging:  sorted[sorted.length - 1].name,
-    score:    currentScore,
-    gap:      sorted[0].score - (sorted[1]?.score ?? 0),
+    team:    current.name,
+    others:  others.map(g => g.name),
+    leader:  sorted[0].name,
+    lagging: sorted[sorted.length - 1].name,
+    score:   currentScore,
+    gap:     sorted[0].score - (sorted[1]?.score ?? 0),
     winScore,
   }
 }
@@ -38,40 +39,73 @@ export function useGame() {
   const [usedChallenges, setUsedChallenges] = useState<Record<string, number[]>>({})
   const [announcerLine, setAnnouncerLine] = useState(getAnnouncerLine('welcome'))
 
-  const startGame = useCallback((groupNames: string[], targetScore: number) => {
+  // API question pools — keyed by 'kids' | 'adults'
+  const [apiQuestions, setApiQuestions] = useState<Record<string, ChallengeItem[]>>({})
+  const [questionsReady, setQuestionsReady] = useState(false)
+
+  // Pre-fetch as soon as a category is chosen on the welcome screen
+  useEffect(() => {
+    const cats: ('kids' | 'adults')[] = category === 'mixed' ? ['kids', 'adults']
+      : [category as 'kids' | 'adults']
+    prefetchTrivia(cats)
+  }, [category])
+
+  /** Resolve which DB category key to use (handles 'mixed'). */
+  function resolvecat(): 'kids' | 'adults' {
+    if (category === 'mixed') return Math.random() < 0.5 ? 'kids' : 'adults'
+    return category as 'kids' | 'adults'
+  }
+
+  const startGame = useCallback(async (groupNames: string[], targetScore: number) => {
     const newGroups = groupNames.map((name, i) => ({ name, score: 0, color: GROUP_COLORS[i] }))
     setGroups(newGroups)
     setWinScore(targetScore)
     setCurrentGroupIdx(0)
     setRound(1)
     setUsedChallenges({})
-    // first turn announcement
+    setQuestionsReady(false)
+
+    // Fetch questions in parallel while player reads the board
+    const cats: ('kids' | 'adults')[] = category === 'mixed' ? ['kids', 'adults']
+      : [category as 'kids' | 'adults']
+
+    const results = await Promise.all(cats.map(c => getTriviaQuestions(c)))
+    const merged: Record<string, ChallengeItem[]> = {}
+    cats.forEach((c, i) => { merged[c] = results[i] })
+    setApiQuestions(merged)
+    setQuestionsReady(true)
+
     const others = newGroups.slice(1).map(g => g.name)
     setAnnouncerLine(getAnnouncerLine('turn', {
       team: newGroups[0].name,
       others,
       leader: newGroups[0].name,
       lagging: newGroups[newGroups.length - 1].name,
-      score: 0,
-      gap: 0,
-      winScore: targetScore,
+      score: 0, gap: 0, winScore: targetScore,
     }))
     setScreen('board')
-  }, [])
+  }, [category])
 
   const drawChallenge = useCallback((typeId: string) => {
     const type = CHALLENGE_TYPES.find(t => t.id === typeId)!
-    const catData = category === 'mixed'
-      ? (Math.random() < 0.5 ? DB.kids : DB.adults)
-      : DB[category as 'kids' | 'adults']
+    const catKey = resolvecat()
+    const catData = DB[catKey]
 
-    const pool = (catData[typeId as keyof typeof catData] ?? []) as ActiveChallenge['item'][]
+    // For 'question', prefer API pool; fall back to DB if not loaded yet
+    let pool: ChallengeItem[]
+    if (typeId === 'question') {
+      const apiPool = apiQuestions[catKey] ?? []
+      pool = apiPool.length > 0 ? apiPool : catData.question
+    } else {
+      pool = (catData[typeId as keyof typeof catData] ?? []) as ChallengeItem[]
+    }
+
     if (pool.length === 0) return
 
     const used = usedChallenges[typeId] ?? []
     const available = pool.map((item, i) => ({ item, i })).filter(({ i }) => !used.includes(i))
 
-    let chosen: { item: ActiveChallenge['item']; i: number }
+    let chosen: { item: ChallengeItem; i: number }
     if (available.length === 0) {
       const idx = Math.floor(Math.random() * pool.length)
       chosen = { item: pool[idx], i: idx }
@@ -85,7 +119,7 @@ export function useGame() {
     const ctx = buildCtx(groups, currentGroupIdx, winScore)
     setAnnouncerLine(getAnnouncerLine(typeId, ctx))
     setScreen('challenge')
-  }, [category, usedChallenges, groups, currentGroupIdx, winScore])
+  }, [category, usedChallenges, groups, currentGroupIdx, winScore, apiQuestions])
 
   const submitResult = useCallback((result: ResultType) => {
     const newScore = result === 'correct'
@@ -105,19 +139,11 @@ export function useGame() {
       return
     }
 
-    // Pick the most contextually fitting announcement
-    let annType: string
-    if (result === 'correct') {
-      // pressure if one step from winning
-      annType = newScore >= winScore - 1 ? 'pressure' : 'correct'
-    } else if (result === 'wrong') {
-      annType = 'wrong'
-    } else {
-      annType = 'skip'
-    }
+    let annType = result === 'correct'
+      ? (newScore >= winScore - 1 ? 'pressure' : 'correct')
+      : result === 'wrong' ? 'wrong' : 'skip'
     let line = getAnnouncerLine(annType, ctx)
 
-    // Override with comeback/leading/close commentary occasionally
     const sorted = [...updatedGroups].sort((a, b) => b.score - a.score)
     const gap = sorted[0].score - (sorted[1]?.score ?? 0)
     if (result === 'correct' && gap >= 3 && sorted[0].name === groups[currentGroupIdx].name) {
@@ -129,14 +155,9 @@ export function useGame() {
     }
 
     setAnnouncerLine(line)
-
     const nextIdx = (currentGroupIdx + 1) % groups.length
     if (nextIdx === 0) setRound(r => r + 1)
     setCurrentGroupIdx(nextIdx)
-
-    // next turn announcement injected into the board after a brief read
-    // we append a second line so board shows the result comment on arrival
-    // and the turn banner already shows the name – no extra state needed
     setScreen('board')
   }, [currentGroupIdx, groups, winScore])
 
@@ -159,6 +180,8 @@ export function useGame() {
     setRound(1)
     setActiveChallenge(null)
     setUsedChallenges({})
+    setApiQuestions({})
+    setQuestionsReady(false)
     setAnnouncerLine(getAnnouncerLine('welcome'))
     setScreen('welcome')
   }, [])
@@ -172,6 +195,7 @@ export function useGame() {
     round,
     activeChallenge,
     announcerLine, setAnnouncerLine,
+    questionsReady,
     startGame,
     drawChallenge,
     submitResult,
