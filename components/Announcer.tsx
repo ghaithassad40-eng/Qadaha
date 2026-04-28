@@ -9,7 +9,8 @@ interface Props {
 }
 
 function stripEmoji(str: string): string {
-  return str.replace(/[\u{1F000}-\u{1FFFF}]|[\u{2600}-\u{27BF}]|[\u{FE00}-\u{FEFF}]/gu, '').trim()
+  // Remove surrogate pairs (emoji) and variation selectors
+  return str.replace(/[\uD800-\uDFFF]|[☀-➿]|[︀-﻿]/g, '').trim()
 }
 
 export function Announcer({ text, avatar = '🎙️' }: Props) {
